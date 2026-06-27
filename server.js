@@ -198,3 +198,24 @@ app.listen(PORT, () => {
   console.log(`[E-Tuklas] Push server running on port ${PORT} ✓`);
   console.log(`[E-Tuklas] Watching Firestore for announcements & grades...`);
 });
+
+
+/* ── KEEP ALIVE PING ──────────────────────────────────────────
+   Pings the server every 14 minutes so Render never sleeps.
+   Free plan sleeps after 15 min inactivity — this prevents it.
+   Result: notifications arrive in 5-10 seconds instead of 50s.
+─────────────────────────────────────────────────────────────── */
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || '';
+if (RENDER_URL) {
+  setInterval(function() {
+    const https = require('https');
+    const http  = require('http');
+    const lib   = RENDER_URL.startsWith('https') ? https : http;
+    lib.get(RENDER_URL, function(res) {
+      console.log('[Keep-Alive] Ping ✓ server staying awake');
+    }).on('error', function(e) {
+      console.warn('[Keep-Alive] Ping failed:', e.message);
+    });
+  }, 14 * 60 * 1000); // every 14 minutes
+  console.log('[Keep-Alive] Auto-ping enabled ✓ — server will not sleep');
+}
