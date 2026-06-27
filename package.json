@@ -1,13 +1,14 @@
 {
   "name": "etuklas-push-server",
-  "version": "1.0.0",
-  "description": "E-Tuklas STE Portal — Push Notification Backend",
+  "version": "2.0.0",
+  "description": "E-Tuklas Push Server — FCM + iOS Native Web Push",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "engines": { "node": "18" },
   "dependencies": {
     "express": "^4.18.2",
-    "firebase-admin": "^12.0.0"
+    "firebase-admin": "^12.0.0",
+    "web-push": "^3.6.7"
   },
   "private": true
 }
