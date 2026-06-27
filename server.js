@@ -1,7 +1,6 @@
 /**
- * E-TUKLAS STE PORTAL — PUSH NOTIFICATION BACKEND v2.1
- * Fixed: grade watcher startup guard, url in all payloads,
- *        /subscribe endpoint, iOS payload fields
+ * E-TUKLAS STE PORTAL — PUSH NOTIFICATION BACKEND v2
+ * Supports both FCM (Android) and Native Web Push (iOS Safari PWA)
  */
 
 const express  = require('express');
@@ -30,34 +29,39 @@ webpush.setVapidDetails(
   process.env.VAPID_PRIVATE_KEY || ''
 );
 
-/* ── PORTAL URL ─────────────────────────────────────────────── */
-const PORTAL_URL = process.env.PORTAL_URL || 'https://sabnahis-ste.github.io/';
-
 /* ── GET ALL TOKENS & SUBSCRIPTIONS ────────────────────────── */
 async function getAllTargets(targetGrades = [], targetSections = []) {
-  const snap      = await db.collection('users').get();
+  const snap   = await db.collection('users').get();
   const fcmTokens = [];
   const webSubs   = [];
 
   snap.forEach(doc => {
     const user = doc.data();
 
+    // Grade filter
     if (targetGrades.length > 0 && !targetGrades.includes(user.grade)) return;
+    // Section filter
     if (targetSections.length > 0) {
       const sec = (user.section || '').trim().toLowerCase();
       if (!targetSections.includes(sec)) return;
     }
 
+    // FCM tokens (Android / Chrome)
     if (user.fcmTokens && user.fcmTokens.length) {
       user.fcmTokens.forEach(t => { if (t && t.length > 20) fcmTokens.push(t); });
     }
 
+    // Native web push subscription (iOS Safari PWA)
     if (user.webpushSubscription) {
       try {
         var sub = typeof user.webpushSubscription === 'string'
           ? JSON.parse(user.webpushSubscription)
           : user.webpushSubscription;
-        if (sub && sub.endpoint) webSubs.push(sub);
+        if (sub && sub.endpoint && sub.keys && sub.keys.auth && sub.keys.p256dh) {
+          webSubs.push(sub);
+        } else if (sub && sub.endpoint) {
+          console.warn(`[WebPush] Skipping sub for ${doc.id} — missing keys (user needs to re-open app)`);
+        }
       } catch(e) {}
     }
   });
@@ -69,9 +73,6 @@ async function getAllTargets(targetGrades = [], targetSections = []) {
 async function sendPush(title, body, data = {}, targetGrades = [], targetSections = []) {
   const { fcmTokens, webSubs } = await getAllTargets(targetGrades, targetSections);
 
-  // ✅ FIX: Always include url so notificationclick navigates correctly
-  const url = data.url || PORTAL_URL;
-
   console.log(`[FCM] Sending to ${fcmTokens.length} FCM token(s) and ${webSubs.length} iOS subscription(s)...`);
 
   // ── FCM (Android / Chrome) ────────────────────────────────
@@ -82,7 +83,7 @@ async function sendPush(title, body, data = {}, targetGrades = [], targetSection
       try {
         const res = await fcm.sendEachForMulticast({
           notification: { title, body },
-          data: { title, body, url, ...data },
+          data: { title, body, ...data },
           webpush: {
             notification: {
               title, body,
@@ -92,28 +93,11 @@ async function sendPush(title, body, data = {}, targetGrades = [], targetSection
               requireInteraction: data.priority === 'urgent',
               vibrate:            [200, 100, 200],
             },
-            fcmOptions: { link: url },
+            fcmOptions: { link: 'https://sabnahis-ste.github.io/' },
           },
           tokens: batch,
         });
         console.log(`[FCM] ✓ ${res.successCount} sent, ✗ ${res.failureCount} failed`);
-
-        // Clean up invalid tokens
-        res.responses.forEach((r, idx) => {
-          if (!r.success && r.error &&
-              (r.error.code === 'messaging/invalid-registration-token' ||
-               r.error.code === 'messaging/registration-token-not-registered')) {
-            console.log(`[FCM] Removing stale token: ${batch[idx].substring(0, 20)}...`);
-            // Best-effort cleanup — find and remove from Firestore
-            db.collection('users')
-              .where('fcmTokens', 'array-contains', batch[idx])
-              .get()
-              .then(snap => snap.forEach(doc =>
-                doc.ref.update({ fcmTokens: admin.firestore.FieldValue.arrayRemove(batch[idx]) })
-              ))
-              .catch(() => {});
-          }
-        });
       } catch(err) {
         console.error('[FCM] Error:', err.message);
       }
@@ -122,34 +106,9 @@ async function sendPush(title, body, data = {}, targetGrades = [], targetSection
 
   // ── Native Web Push (iOS Safari PWA) ─────────────────────
   if (webSubs.length > 0 && process.env.VAPID_PRIVATE_KEY) {
-    // ✅ FIX: Include url and tag in iOS payload so SW can use them
-    const payload = JSON.stringify({
-      title,
-      body,
-      url,
-      tag:      data.tag      || 'etuklas-notif',
-      priority: data.priority || 'normal',
-      type:     data.type     || 'general',
-      icon:     data.icon     || null,
-    });
-
+    const payload = JSON.stringify({ title, body, ...data });
     const results = await Promise.allSettled(
-      webSubs.map(sub =>
-        webpush.sendNotification(sub, payload).catch(err => {
-          // ✅ FIX: Clean up expired iOS subscriptions (410 Gone)
-          if (err.statusCode === 410 || err.statusCode === 404) {
-            console.log('[WebPush iOS] Removing expired subscription');
-            db.collection('users')
-              .where('webpushSubscription.endpoint', '==', sub.endpoint)
-              .get()
-              .then(snap => snap.forEach(doc =>
-                doc.ref.update({ webpushSubscription: admin.firestore.FieldValue.delete() })
-              ))
-              .catch(() => {});
-          }
-          throw err;
-        })
-      )
+      webSubs.map(sub => webpush.sendNotification(sub, payload))
     );
     const ok   = results.filter(r => r.status === 'fulfilled').length;
     const fail = results.filter(r => r.status === 'rejected').length;
@@ -164,7 +123,6 @@ const startedAt = Date.now();
 
 db.collection('announcements')
   .orderBy('createdAt', 'desc')
-  .limit(1)
   .onSnapshot(snap => {
     snap.docChanges().forEach(async change => {
       if (change.type !== 'added') return;
@@ -178,27 +136,18 @@ db.collection('announcements')
 
       console.log(`[Push] New announcement: "${data.title}"`);
       await sendPush(title, body, {
-        type:     'announcement',
-        priority: data.priority || 'normal',
-        icon,
-        tag:      'etuklas-announcement',
-        url:      PORTAL_URL,
+        type: 'announcement', priority: data.priority || 'normal',
+        icon, tag: 'etuklas-announcement',
       }, data.targetGrades || [], data.targetSections || []);
     });
   }, err => console.error('[Push] Listener error:', err.message));
 
 /* ── WATCH GRADES ───────────────────────────────────────────── */
-// ✅ FIX: Added startedAt guard to prevent re-firing on server restart
 db.collection('studies').onSnapshot(snap => {
   snap.docChanges().forEach(async change => {
     if (change.type !== 'modified') return;
     const data = change.doc.data();
-
-    // Skip if already notified
     if (!data.grade || data.gradeNotifiedAt) return;
-
-    // ✅ FIX: Skip docs that were graded before this server instance started
-    if (data.gradedAt && new Date(data.gradedAt).getTime() < startedAt - 10000) return;
 
     const authorId = data.authorId || data.userId;
     if (!authorId) return;
@@ -209,42 +158,35 @@ db.collection('studies').onSnapshot(snap => {
 
     const title = `⭐ Your study was graded!`;
     const body  = `"${(data.title || 'Your study').substring(0, 60)}" received a grade of ${data.grade}.`;
-    // ✅ FIX: Include url in grade notification
-    const url   = PORTAL_URL;
 
-    const fcmTargets = user.fcmTokens || [];
-    const webSub = user.webpushSubscription
-      ? [typeof user.webpushSubscription === 'string'
+    const targets = [];
+    if (user.fcmTokens)          targets.push(...user.fcmTokens);
+    const rawSub = user.webpushSubscription
+      ? (typeof user.webpushSubscription === 'string'
           ? JSON.parse(user.webpushSubscription)
-          : user.webpushSubscription]
-      : [];
+          : user.webpushSubscription)
+      : null;
+    // ✅ FIX: Only use sub if it has encryption keys (saved via .toJSON())
+    const webSub = (rawSub && rawSub.endpoint && rawSub.keys && rawSub.keys.auth && rawSub.keys.p256dh)
+      ? [rawSub] : [];
 
     console.log(`[Push] Grade notification → ${authorId}`);
 
     // Send FCM
-    if (fcmTargets.length > 0) {
+    if (targets.length > 0) {
       try {
         await fcm.sendEachForMulticast({
           notification: { title, body },
-          data: { title, body, url, type: 'grade', icon: '⭐', tag: 'etuklas-grade' },
-          webpush: {
-            notification: { title, body, icon: '/LOGO.png' },
-            fcmOptions:   { link: url },
-          },
-          tokens: fcmTargets,
+          data: { title, body, type: 'grade', icon: '⭐', tag: 'etuklas-grade' },
+          webpush: { notification: { title, body, icon: '/LOGO.png' } },
+          tokens: targets,
         });
       } catch(e) { console.error('[FCM] Grade error:', e.message); }
     }
 
     // Send native web push (iOS)
     if (webSub.length > 0 && process.env.VAPID_PRIVATE_KEY) {
-      // ✅ FIX: Include url and tag in iOS grade payload
-      const payload = JSON.stringify({
-        title, body, url,
-        type: 'grade',
-        icon: '⭐',
-        tag:  'etuklas-grade',
-      });
+      const payload = JSON.stringify({ title, body, type: 'grade', icon: '⭐' });
       await Promise.allSettled(webSub.map(s => webpush.sendNotification(s, payload)));
     }
 
@@ -254,51 +196,14 @@ db.collection('studies').onSnapshot(snap => {
 
 /* ── ROUTES ─────────────────────────────────────────────────── */
 app.get('/', (req, res) => {
-  res.json({ status: 'running', service: 'E-Tuklas Push Server v2.1', time: new Date().toISOString() });
+  res.json({ status: 'running', service: 'E-Tuklas Push Server', time: new Date().toISOString() });
 });
 
 app.post('/send-test', async (req, res) => {
   try {
-    await sendPush('🔔 Test', 'E-Tuklas push notifications are working!', {
-      type: 'test',
-      tag:  'etuklas-test',
-      url:  PORTAL_URL,
-    });
+    await sendPush('🔔 Test', 'E-Tuklas push notifications are working!', { type: 'test' });
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-/* ── ✅ NEW: /subscribe — save iOS web push subscription ─────── */
-app.post('/subscribe', async (req, res) => {
-  const { userId, subscription } = req.body;
-  if (!userId || !subscription || !subscription.endpoint) {
-    return res.status(400).json({ error: 'userId and subscription required' });
-  }
-  try {
-    await db.collection('users').doc(userId).update({
-      webpushSubscription: subscription,
-    });
-    console.log(`[WebPush] Saved subscription for user: ${userId}`);
-    res.json({ success: true });
-  } catch(e) {
-    console.error('[WebPush] Save error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-/* ── ✅ NEW: /unsubscribe — remove iOS web push subscription ─── */
-app.post('/unsubscribe', async (req, res) => {
-  const { userId } = req.body;
-  if (!userId) return res.status(400).json({ error: 'userId required' });
-  try {
-    await db.collection('users').doc(userId).update({
-      webpushSubscription: admin.firestore.FieldValue.delete(),
-    });
-    console.log(`[WebPush] Removed subscription for user: ${userId}`);
-    res.json({ success: true });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
 });
 
 /* ── KEEP ALIVE ──────────────────────────────────────────────── */
@@ -318,6 +223,5 @@ if (RENDER_URL) {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`[E-Tuklas] Push server on port ${PORT} ✓`);
-  console.log(`[E-Tuklas] Portal URL: ${PORTAL_URL}`);
   console.log(`[E-Tuklas] Watching Firestore...`);
 });
