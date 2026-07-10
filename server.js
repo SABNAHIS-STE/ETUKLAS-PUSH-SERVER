@@ -1,220 +1,214 @@
 /**
- * E-TUKLAS STE PORTAL — PUSH NOTIFICATION BACKEND v2
- * Supports both FCM (Android) and Native Web Push (iOS Safari PWA)
+ * E-TUKLAS / SABNAHIS STE PORTAL — PUSH + NOTIFICATION BACKEND v3
+ * ---------------------------------------------------------------------------
+ * Rewritten for the Firebase → Supabase migration. Replaces:
+ *   - firebase-admin / Firestore              -> @supabase/supabase-js
+ *   - FCM (Android/Chrome push)                -> removed (see note below)
+ *   - Firestore onSnapshot watchers            -> removed (see note below)
+ *
+ * WHY FCM IS GONE: compat-shim.js's messaging.getToken() always resolves
+ * null now, so the client's own `if (token) ... else tryNativePush()`
+ * fallback runs unconditionally on every platform — nothing has registered
+ * an fcmToken since the migration. It was dead weight, not a bug to fix.
+ *
+ * WHY THE onSnapshot WATCHERS ARE GONE: they watched Firestore, which stopped
+ * receiving writes once the app moved to Supabase — that's the root reason
+ * push notifications appeared to stop working. Rather than re-implement
+ * them as Supabase Realtime watchers (fragile on a free-tier server that
+ * can sleep, and this app already calls the right code at the right time),
+ * push now fires synchronously from the same request that creates the
+ * notification:
+ *   - Grading (submitTeacherFeedback) and any other cross-user notification
+ *     -> POST /notifications -> writes user_notifications row + sends push,
+ *     in one request, no watcher needed.
+ *   - Announcements already have their own working push path: the client
+ *     calls the `send-push` Supabase Edge Function directly on creation.
+ *     Do NOT also watch the announcements table here — that would send
+ *     every announcement push twice.
+ *
+ * REQUIRED ENV VARS:
+ *   SUPABASE_URL               e.g. https://fbzcztctelidztwjhkea.supabase.co
+ *   SUPABASE_SERVICE_ROLE_KEY  Project Settings > API > service_role (secret)
+ *   VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY   (unchanged from before)
+ *   RENDER_EXTERNAL_URL        (unchanged — keep-alive ping)
+ *
+ * REMOVE:  FIREBASE_SERVICE_ACCOUNT (no longer used)
+ *
+ * npm install @supabase/supabase-js web-push express
+ * npm uninstall firebase-admin   (optional cleanup, not required to work)
+ * ---------------------------------------------------------------------------
  */
 
-const express  = require('express');
-const admin    = require('firebase-admin');
-const webpush  = require('web-push');
-const app      = express();
+const express = require('express');
+const webpush = require('web-push');
+const crypto  = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
+
+const app = express();
 app.use(express.json());
 
-/* ── FIREBASE ADMIN ─────────────────────────────────────────── */
-let db, fcm;
-try {
-  const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  admin.initializeApp({ credential: admin.credential.cert(sa), projectId: 'sabnahis-portal' });
-  db  = admin.firestore();
-  fcm = admin.messaging();
-  console.log('[E-Tuklas] Firebase Admin connected ✓');
-} catch(e) {
-  console.error('[E-Tuklas] Firebase init failed:', e.message);
+/* ── CORS ─────────────────────────────────────────────────────
+ * The frontend (GitHub Pages) calls this server directly from the
+ * browser now, cross-origin — the old Firestore-watcher design never
+ * needed this since nothing called into the server from the client.  */
+const ALLOWED_ORIGIN = 'https://sabnahis-ste.github.io';
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+/* ── SUPABASE ADMIN ──────────────────────────────────────────── */
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('[E-Tuklas] Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY env vars.');
   process.exit(1);
 }
+const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { autoRefreshToken: false, persistSession: false }
+});
+console.log('[E-Tuklas] Supabase admin client connected ✓');
 
-/* ── WEB PUSH (for iOS Safari PWA native push) ──────────────── */
+/* ── WEB PUSH (VAPID) ────────────────────────────────────────── */
 webpush.setVapidDetails(
   'mailto:admin@sabnahis.edu.ph',
   process.env.VAPID_PUBLIC_KEY  || '',
   process.env.VAPID_PRIVATE_KEY || ''
 );
 
-/* ── GET ALL TOKENS & SUBSCRIPTIONS ────────────────────────── */
-async function getAllTargets(targetGrades = [], targetSections = []) {
-  const snap   = await db.collection('users').get();
-  const fcmTokens = [];
-  const webSubs   = [];
+/* ── AUTH: verify the caller's Supabase JWT ─────────────────────
+ * The frontend sends the logged-in user's access token as a normal
+ * Bearer header (see API._pushServerAuthHeader in app.html).          */
+async function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Missing Authorization header' });
 
-  snap.forEach(doc => {
-    const user = doc.data();
+  const { data, error } = await sb.auth.getUser(token);
+  if (error || !data.user) return res.status(401).json({ error: 'Invalid or expired session' });
 
-    // Grade filter
-    if (targetGrades.length > 0 && !targetGrades.includes(user.grade)) return;
-    // Section filter
-    if (targetSections.length > 0) {
-      const sec = (user.section || '').trim().toLowerCase();
-      if (!targetSections.includes(sec)) return;
-    }
-
-    // FCM tokens (Android / Chrome)
-    if (user.fcmTokens && user.fcmTokens.length) {
-      user.fcmTokens.forEach(t => { if (t && t.length > 20) fcmTokens.push(t); });
-    }
-
-    // Native web push subscription (iOS Safari PWA)
-    if (user.webpushSubscription) {
-      try {
-        var sub = typeof user.webpushSubscription === 'string'
-          ? JSON.parse(user.webpushSubscription)
-          : user.webpushSubscription;
-        if (sub && sub.endpoint && sub.keys && sub.keys.auth && sub.keys.p256dh) {
-          webSubs.push(sub);
-        } else if (sub && sub.endpoint) {
-          console.warn(`[WebPush] Skipping sub for ${doc.id} — missing keys (user needs to re-open app)`);
-        }
-      } catch(e) {}
-    }
-  });
-
-  return { fcmTokens, webSubs };
+  req.callerUid = data.user.id;
+  next();
 }
 
-/* ── SEND PUSH ──────────────────────────────────────────────── */
-async function sendPush(title, body, data = {}, targetGrades = [], targetSections = []) {
-  const { fcmTokens, webSubs } = await getAllTargets(targetGrades, targetSections);
+/* ── HELPERS ─────────────────────────────────────────────────── */
 
-  console.log(`[FCM] Sending to ${fcmTokens.length} FCM token(s) and ${webSubs.length} iOS subscription(s)...`);
+// Matches compat-shim's physicalId() convention for root-level docs
+// getting a subcollection row: "<parentUid>::<uuid>"
+function makeRowId(uid) {
+  return `${uid}::${crypto.randomUUID()}`;
+}
 
-  // ── FCM (Android / Chrome) ────────────────────────────────
-  if (fcmTokens.length > 0) {
-    const BATCH = 500;
-    for (let i = 0; i < fcmTokens.length; i += BATCH) {
-      const batch = fcmTokens.slice(i, i + BATCH);
-      try {
-        const res = await fcm.sendEachForMulticast({
-          notification: { title, body },
-          data: { title, body, ...data },
-          webpush: {
-            notification: {
-              title, body,
-              icon:               '/LOGO.png',
-              badge:              '/LOGO.png',
-              tag:                data.tag || 'etuklas-notif',
-              requireInteraction: data.priority === 'urgent',
-              vibrate:            [200, 100, 200],
-            },
-            fcmOptions: { link: 'https://sabnahis-ste.github.io/' },
-          },
-          tokens: batch,
-        });
-        console.log(`[FCM] ✓ ${res.successCount} sent, ✗ ${res.failureCount} failed`);
-      } catch(err) {
-        console.error('[FCM] Error:', err.message);
-      }
+function buildNotifData({ type, title, body, link }) {
+  if (!type || !title) throw Object.assign(new Error('type and title are required'), { status: 400 });
+  return {
+    type,
+    title,
+    body: body || '',
+    link: link || null,
+    createdAt: new Date().toISOString(),
+    read: false
+  };
+}
+
+// Reads a user's row from the `users` table. Note: this app's tables
+// store Firestore-style fields inside a `data` jsonb column (see
+// compat-shim.js TABLE_MAP / rpcMutate) — there are no flat columns
+// like `grade` or `webpush_subscription`, everything is data->>field.
+async function getUser(uid) {
+  const { data, error } = await sb.from('users').select('id,data').eq('id', uid).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+// Sends a Web Push notification to one user's registered subscription.
+// Best-effort: failures are logged, never thrown — a push failure must
+// never fail the notification-creation request itself.
+async function sendPushToUser(uid, { title, body, type }) {
+  try {
+    const user = await getUser(uid);
+    const rawSub = user && user.data && user.data.webpushSubscription;
+    if (!rawSub) return; // user has no push subscription registered — fine, in-app bell still got the row
+
+    const sub = typeof rawSub === 'string' ? JSON.parse(rawSub) : rawSub;
+    if (!sub || !sub.endpoint || !sub.keys || !sub.keys.auth || !sub.keys.p256dh) {
+      console.warn(`[WebPush] Skipping ${uid} — subscription missing encryption keys (needs to re-open app)`);
+      return;
     }
-  }
+    if (!process.env.VAPID_PRIVATE_KEY) return;
 
-  // ── Native Web Push (iOS Safari PWA) ─────────────────────
-  if (webSubs.length > 0 && process.env.VAPID_PRIVATE_KEY) {
-    const payload = JSON.stringify({ title, body, ...data });
-    const results = await Promise.allSettled(
-      webSubs.map(sub => webpush.sendNotification(sub, payload))
-    );
-    const ok   = results.filter(r => r.status === 'fulfilled').length;
-    const fail = results.filter(r => r.status === 'rejected').length;
-    console.log(`[WebPush iOS] ✓ ${ok} sent, ✗ ${fail} failed`);
-  } else if (webSubs.length > 0) {
-    console.warn('[WebPush iOS] Skipped — VAPID_PRIVATE_KEY not set');
+    await webpush.sendNotification(sub, JSON.stringify({ title, body, tag: type || 'etuklas-notif' }));
+  } catch (e) {
+    console.warn(`[WebPush] Send failed for ${uid}:`, e.message);
   }
 }
 
-/* ── WATCH ANNOUNCEMENTS ────────────────────────────────────── */
-const startedAt = Date.now();
+/* ── ROUTES: notifications (bell row + push, one call) ──────────
+ * These replace the direct-to-Supabase writes that RLS correctly blocks
+ * client-side (a user can't insert a notification row for another uid).
+ */
 
-db.collection('announcements')
-  .orderBy('createdAt', 'desc')
-  .onSnapshot(snap => {
-    snap.docChanges().forEach(async change => {
-      if (change.type !== 'added') return;
-      const data = change.doc.data();
-      if (new Date(data.createdAt).getTime() < startedAt - 10000) return;
-      if (data.scheduled && new Date(data.scheduledAt).getTime() > Date.now() + 60000) return;
+// POST /notifications  { uid, type, title, body?, link? }
+app.post('/notifications', requireAuth, async (req, res) => {
+  try {
+    const { uid, type, title, body, link } = req.body || {};
+    if (!uid) return res.status(400).json({ error: 'uid is required' });
 
-      const icon  = { urgent:'🚨', important:'❗', normal:'📢' }[data.priority] || '📢';
-      const title = `${icon} ${data.title || 'New Announcement'}`;
-      const body  = (data.body || '').substring(0, 120);
+    const data = buildNotifData({ type, title, body, link });
+    const { error } = await sb.from('user_notifications').insert({ id: makeRowId(uid), parent_id: uid, data });
+    if (error) throw error;
 
-      console.log(`[Push] New announcement: "${data.title}"`);
-      await sendPush(title, body, {
-        type: 'announcement', priority: data.priority || 'normal',
-        icon, tag: 'etuklas-announcement',
-      }, data.targetGrades || [], data.targetSections || []);
-    });
-  }, err => console.error('[Push] Listener error:', err.message));
+    sendPushToUser(uid, data); // fire-and-forget, doesn't block the response
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[E-Tuklas] POST /notifications failed:', e.message);
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
 
-/* ── WATCH GRADES ───────────────────────────────────────────── */
-db.collection('studies').onSnapshot(snap => {
-  snap.docChanges().forEach(async change => {
-    if (change.type !== 'modified') return;
-    const data = change.doc.data();
-    if (!data.grade || data.gradeNotifiedAt) return;
-
-    const authorId = data.authorId || data.userId;
-    if (!authorId) return;
-
-    const userDoc = await db.collection('users').doc(authorId).get();
-    if (!userDoc.exists) return;
-    const user = userDoc.data();
-
-    const title = `⭐ Your study was graded!`;
-    const body  = `"${(data.title || 'Your study').substring(0, 60)}" received a grade of ${data.grade}.`;
-
-    const targets = [];
-    if (user.fcmTokens)          targets.push(...user.fcmTokens);
-    const rawSub = user.webpushSubscription
-      ? (typeof user.webpushSubscription === 'string'
-          ? JSON.parse(user.webpushSubscription)
-          : user.webpushSubscription)
-      : null;
-    // ✅ FIX: Only use sub if it has encryption keys (saved via .toJSON())
-    const webSub = (rawSub && rawSub.endpoint && rawSub.keys && rawSub.keys.auth && rawSub.keys.p256dh)
-      ? [rawSub] : [];
-
-    console.log(`[Push] Grade notification → ${authorId}`);
-
-    // Send FCM
-    if (targets.length > 0) {
-      try {
-        await fcm.sendEachForMulticast({
-          notification: { title, body },
-          data: { title, body, type: 'grade', icon: '⭐', tag: 'etuklas-grade' },
-          webpush: { notification: { title, body, icon: '/LOGO.png' } },
-          tokens: targets,
-        });
-      } catch(e) { console.error('[FCM] Grade error:', e.message); }
+// POST /notifications/batch  { uids: [...], type, title, body?, link? }
+app.post('/notifications/batch', requireAuth, async (req, res) => {
+  try {
+    const { uids, type, title, body, link } = req.body || {};
+    if (!Array.isArray(uids) || uids.length === 0) {
+      return res.status(400).json({ error: 'uids must be a non-empty array' });
     }
 
-    // Send native web push (iOS)
-    if (webSub.length > 0 && process.env.VAPID_PRIVATE_KEY) {
-      const payload = JSON.stringify({ title, body, type: 'grade', icon: '⭐' });
-      await Promise.allSettled(webSub.map(s => webpush.sendNotification(s, payload)));
+    const data = buildNotifData({ type, title, body, link });
+    const rows = uids.map((uid) => ({ id: makeRowId(uid), parent_id: uid, data }));
+
+    for (let i = 0; i < rows.length; i += 400) {
+      const { error } = await sb.from('user_notifications').insert(rows.slice(i, i + 400));
+      if (error) throw error;
     }
 
-    await change.doc.ref.update({ gradeNotifiedAt: new Date().toISOString() });
-  });
-}, err => console.error('[Push] Studies error:', err.message));
+    uids.forEach((uid) => sendPushToUser(uid, data));
+    res.json({ ok: true, count: uids.length });
+  } catch (e) {
+    console.error('[E-Tuklas] POST /notifications/batch failed:', e.message);
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
 
-/* ── ROUTES ─────────────────────────────────────────────────── */
+/* ── MISC ROUTES ─────────────────────────────────────────────── */
 app.get('/', (req, res) => {
   res.json({ status: 'running', service: 'E-Tuklas Push Server', time: new Date().toISOString() });
 });
 
-app.post('/send-test', async (req, res) => {
+app.post('/send-test', requireAuth, async (req, res) => {
   try {
-    await sendPush('🔔 Test', 'E-Tuklas push notifications are working!', { type: 'test' });
+    await sendPushToUser(req.callerUid, { title: '🔔 Test', body: 'E-Tuklas push notifications are working!', type: 'test' });
     res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 /* ── KEEP ALIVE ──────────────────────────────────────────────── */
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || '';
 if (RENDER_URL) {
-  setInterval(function() {
-    require('https').get(RENDER_URL, function() {
-      console.log('[Keep-Alive] Ping ✓');
-    }).on('error', function(e) {
-      console.warn('[Keep-Alive] Failed:', e.message);
-    });
+  setInterval(() => {
+    require('https').get(RENDER_URL, () => console.log('[Keep-Alive] Ping ✓'))
+      .on('error', (e) => console.warn('[Keep-Alive] Failed:', e.message));
   }, 14 * 60 * 1000);
   console.log('[Keep-Alive] Auto-ping enabled ✓');
 }
@@ -223,5 +217,4 @@ if (RENDER_URL) {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`[E-Tuklas] Push server on port ${PORT} ✓`);
-  console.log(`[E-Tuklas] Watching Firestore...`);
 });
